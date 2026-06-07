@@ -68,6 +68,19 @@ export class VSCodeToolProvider {
                     type: 'object',
                     properties: {}
                 }
+            },
+            {
+                serverName: 'vscode',
+                name: 'vscode_write_file',
+                description: 'Write content to a file, creating it if it does not exist',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        uri: { type: 'string', description: 'The absolute path of the file to write to' },
+                        content: { type: 'string', description: 'The content to write to the file' }
+                    },
+                    required: ['uri', 'content']
+                }
             }
         ];
     }
@@ -84,6 +97,8 @@ export class VSCodeToolProvider {
                 return this.getDiagnostics(args.max);
             case 'vscode_get_active_editor':
                 return this.getActiveEditor();
+            case 'vscode_write_file':
+                return this.writeFile(args.uri, args.content);
             default:
                 throw new Error(`Unknown tool: ${name}`);
         }
@@ -171,6 +186,12 @@ export class VSCodeToolProvider {
         }
 
         return { diagnostics: results };
+    }
+
+    private async writeFile(uriString: string, content: string): Promise<any> {
+        const uri = vscode.Uri.file(uriString);
+        await vscode.workspace.fs.writeFile(uri, Buffer.from(content || '', 'utf8'));
+        return { success: true, path: uriString, size: (content || '').length };
     }
 
     private async getActiveEditor(): Promise<any> {

@@ -9,3 +9,4 @@ out/
 *.cpuprofile
 bun.lock
 coverage/
+.idea/

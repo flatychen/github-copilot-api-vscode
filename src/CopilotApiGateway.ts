@@ -3073,14 +3073,14 @@ export class CopilotApiGateway implements vscode.Disposable {
 	private async processResponsesApi(payload: ResponsesApiRequest): Promise<ResponsesApiResponse> {
 		// OpenAI Responses API format (2026 spec) - convert to chat completion
 		const input = payload?.input;
-		let messages: Array<{ role: string; content: any }> = [];
+		let messages: Array<{ role: string; content: any; tool_calls?: any[]; tool_call_id?: string }> = [];
 
 		// Handle 'instructions' as system message (new in 2026 spec)
 		if (payload.instructions) {
 			messages.push({ role: 'system', content: payload.instructions });
 		}
 
-		// Parse input
+		// Parse input — also handle function_call and function_call_output items
 		if (typeof input === 'string') {
 			messages.push({ role: 'user', content: input });
 		} else if (Array.isArray(input)) {
@@ -3088,30 +3088,37 @@ export class CopilotApiGateway implements vscode.Disposable {
 				if (typeof item === 'string') {
 					messages.push({ role: 'user', content: item });
 				} else if (item.type === 'message' || !item.type) {
-					// Handle message-type input items
 					messages.push({
 						role: item.role || 'user',
 						content: typeof item.content === 'string' ? item.content : JSON.stringify(item.content)
 					});
+				} else if (item.type === 'function_call') {
+					// Previous function call — treat as assistant tool call
+					const fc = item as any;
+					messages.push({
+						role: 'assistant',
+						content: null,
+						tool_calls: [{
+							id: fc.call_id || fc.id,
+							type: 'function',
+							function: { name: fc.name, arguments: typeof fc.arguments === 'string' ? fc.arguments : JSON.stringify(fc.arguments) }
+						}]
+					});
+				} else if (item.type === 'function_call_output') {
+					// Previous tool result — give it to the model
+					const fco = item as any;
+					messages.push({
+						role: 'tool',
+						tool_call_id: fco.call_id || fco.id,
+						content: fco.output || ''
+					});
 				}
-				// Skip other types like 'item_reference' for now
 			}
 		}
 
 		// Inject default system prompt (if not already set via instructions)
 		if (!payload.instructions) {
 			messages = this.injectSystemPrompt(messages);
-		}
-
-		// Build VS Code LM messages
-		const lmMessages: vscode.LanguageModelChatMessage[] = [];
-		for (const msg of messages) {
-			const content = this.redactPromptString(String(msg.content));
-			if (msg.role === 'system' || msg.role === 'user') {
-				lmMessages.push(vscode.LanguageModelChatMessage.User(content));
-			} else if (msg.role === 'assistant') {
-				lmMessages.push(vscode.LanguageModelChatMessage.Assistant(content));
-			}
 		}
 
 		const model = this.resolveModel(payload?.model);
@@ -3126,38 +3133,161 @@ export class CopilotApiGateway implements vscode.Disposable {
 			throw new ApiError(404, `Model "${model}" not found. Available models: ${copilotModels.map(m => m.id).join(', ')}`, 'invalid_request_error', 'model_not_found');
 		}
 
-		// Build model options (new in 2026 spec support)
-		const modelOptions: vscode.LanguageModelChatRequestOptions = {
-			justification: 'Processing Responses API request via Copilot API Gateway'
-		};
+		// Gather tools (same pattern as processChatCompletion)
+		const baseTools = this.normalizeTools(payload?.tools) || [];
 
-		// Invoke Copilot
-		const text = await this.runWithConcurrency(async () => {
-			const cts = new vscode.CancellationTokenSource();
-			try {
-				const response = await selectedModel.sendRequest(lmMessages, modelOptions, cts.token);
-				let result = '';
-				for await (const part of response.stream) {
-					if (part instanceof vscode.LanguageModelTextPart) {
-						result += part.value;
-					} else if (!(part instanceof vscode.LanguageModelToolCallPart)) {
-						const textValue = this.extractTextFromPart(part);
-						if (textValue) { result += textValue; }
+		// Fetch MCP Tools (lazy load if available)
+		const mcpService = await this.ensureMcpService();
+		const mcpTools = mcpService ? await mcpService.getAllTools() : [];
+		const mappedMcpTools: vscode.LanguageModelChatTool[] = mcpTools.map(t => ({
+			name: `mcp_${t.serverName}_${t.name}`,
+			description: t.description || `Tool from MCP server ${t.serverName}`,
+			inputSchema: t.inputSchema
+		}));
+
+		// Fetch native VS Code tools
+		const nativeTools = vscode.lm.tools ? Array.from(vscode.lm.tools).map(t => ({
+			name: t.name,
+			description: t.description || `Built-in VS Code tool ${t.name}`,
+			inputSchema: t.inputSchema
+		})) : [];
+
+		const allTools = baseTools.length > 0
+			? [...baseTools, ...mappedMcpTools, ...nativeTools]
+			: [];
+		const toolChoice = payload?.tool_choice;
+
+		let iterations = 0;
+		const MAX_ITERATIONS = 5;
+		let result: { content: string; toolCalls?: Array<{ name: string; arguments: any }> } = { content: '' };
+		let finalText = '';
+
+		while (iterations < MAX_ITERATIONS) {
+			result = await this.runWithConcurrency(() =>
+				this.invokeResponsesApiWithTools(messages, allTools, toolChoice, selectedModel)
+			);
+
+			if (result.toolCalls && result.toolCalls.length > 0) {
+				const handledToolCalls = result.toolCalls.filter((tc: any) =>
+					tc.name.startsWith('mcp_') || nativeTools.some(nt => nt.name === tc.name)
+				);
+
+				if (handledToolCalls.length > 0) {
+					// Add assistant message with tool calls to history
+					messages.push({
+						role: 'assistant',
+						content: result.content || null,
+						tool_calls: result.toolCalls.map((tc: any) => ({
+							id: `call_${randomUUID().slice(0, 24)}`,
+							type: 'function',
+							function: {
+								name: tc.name,
+								arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments)
+							}
+						}))
+					});
+
+					// Execute MCP and native tools
+					for (const tc of handledToolCalls) {
+						try {
+							let toolResult: any;
+							if (tc.name.startsWith('mcp_')) {
+								const parts = tc.name.split('_');
+								const serverName = parts[1];
+								const toolName = parts.slice(2).join('_');
+
+								const mcp = await this.ensureMcpService();
+								if (!mcp) {
+									throw new Error('MCP service not available');
+								}
+								toolResult = await mcp.callTool(serverName, toolName, tc.arguments);
+							} else {
+								// Native VS Code tools (includes file read/write etc.)
+								const invokeRes = await vscode.lm.invokeTool(tc.name, {
+									input: tc.arguments,
+									toolInvocationToken: undefined
+								}, new vscode.CancellationTokenSource().token);
+								toolResult = invokeRes.content.map(part => {
+									if (part instanceof vscode.LanguageModelTextPart) { return part.value; }
+									return typeof part === 'object' && part ? JSON.stringify(part) : String(part);
+								}).join('\n');
+							}
+							messages.push({
+								role: 'tool',
+								tool_call_id: `call_${randomUUID().slice(0, 24)}`,
+								content: JSON.stringify(toolResult)
+							});
+						} catch (error: any) {
+							messages.push({
+								role: 'tool',
+								tool_call_id: `call_${randomUUID().slice(0, 24)}`,
+								content: `Error executing tool: ${error.message}`
+							});
+						}
 					}
+
+					iterations++;
+					continue; // Loop again with tool results
 				}
-				return result;
-			} finally {
-				cts.dispose();
 			}
+
+			// If we get here, either no tool calls or no MCP/native tool calls
+			finalText = result.content || '';
+			break;
+		}
+
+		// After loop, finalText is the last assistant text content.
+		// Build the output array: include any remaining (client-side) tool calls in the last assistant message
+		const finalOutput: Array<{
+			type: string;
+			id?: string;
+			status?: string;
+			role?: string;
+			content?: Array<{ type: string; text: string; annotations: any[] }>;
+			name?: string;
+			arguments?: string;
+			call_id?: string;
+			output?: string;
+		}> = [];
+
+		// Push the final assistant message with text content
+		finalOutput.push({
+			type: 'message',
+			id: `msg-${randomUUID()}`,
+			status: 'completed',
+			role: 'assistant',
+			content: [
+				{
+					type: 'output_text',
+					text: finalText || '',
+					annotations: []
+				}
+			]
 		});
 
-		// Count tokens
+		// If there are client-side tool calls from the last iteration, include them as function_call items
+		if (result?.toolCalls && result.toolCalls.length > 0) {
+			for (const tc of result.toolCalls) {
+				finalOutput.push({
+					type: 'function_call',
+					id: `call_${randomUUID().slice(0, 24)}`,
+					call_id: `call_${randomUUID().slice(0, 24)}`,
+					name: tc.name,
+					arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments),
+					status: 'completed'
+				});
+			}
+		}
+
+		// Count tokens from the full conversation
 		let inputTokens = 0;
 		let outputTokens = 0;
 		try {
-			const promptStr = messages.map(m => String(m.content)).join('\n');
-			inputTokens = await selectedModel.countTokens(promptStr);
-			outputTokens = await selectedModel.countTokens(text || '');
+			const inputStr = messages.map(m => {
+				return typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+			}).join('\n');
+			inputTokens = await selectedModel.countTokens(inputStr);
+			outputTokens = await selectedModel.countTokens(finalText || '');
 		} catch (e) {
 			console.error('Token counting failed:', e);
 		}
@@ -3174,21 +3304,7 @@ export class CopilotApiGateway implements vscode.Disposable {
 			incomplete_details: null,
 			instructions: payload.instructions ?? null,
 			max_output_tokens: payload.max_output_tokens ?? null,
-			output: [
-				{
-					type: 'message',
-					id: `msg-${randomUUID()}`,
-					status: 'completed',
-					role: 'assistant',
-					content: [
-						{
-							type: 'output_text',
-							text: text || '',
-							annotations: []
-						}
-					]
-				}
-			],
+			output: finalOutput as any,
 			parallel_tool_calls: true,
 			previous_response_id: payload.previous_response_id ?? null,
 			reasoning: {
@@ -3222,17 +3338,117 @@ export class CopilotApiGateway implements vscode.Disposable {
 		};
 	}
 
+	/**
+	 * Invoke the VS Code LM with tool awareness for the Responses API.
+	 * Mirrors invokeCopilotWithTools but without the health / installation checks
+	 * since processResponsesApi already validates those.
+	 */
+	private async invokeResponsesApiWithTools(
+		messages: Array<{ role: string; content: unknown; tool_calls?: any[]; tool_call_id?: string }>,
+		tools?: vscode.LanguageModelChatTool[],
+		toolChoice?: any,
+		selectedModel?: vscode.LanguageModelChat
+	): Promise<{ content: string; toolCalls?: Array<{ name: string; arguments: any }> }> {
+		// Convert messages to VS Code format
+		const lmMessages: vscode.LanguageModelChatMessage[] = [];
+
+		for (const msg of messages) {
+			const content = this.flattenMessageContent(msg.content);
+			switch (msg.role) {
+				case 'system':
+					lmMessages.push(vscode.LanguageModelChatMessage.User(`[System]: ${content}`, (msg as any).name));
+					break;
+				case 'user':
+					lmMessages.push(vscode.LanguageModelChatMessage.User(content, (msg as any).name));
+					break;
+				case 'assistant':
+					if (msg.tool_calls && msg.tool_calls.length > 0) {
+						const toolCallInfo = msg.tool_calls.map((tc: any) =>
+							`[Called function: ${tc.function?.name || tc.name} (${tc.function?.arguments || JSON.stringify(tc.arguments)})]`
+						).join('\n');
+						lmMessages.push(vscode.LanguageModelChatMessage.Assistant(toolCallInfo, (msg as any).name));
+					} else {
+						lmMessages.push(vscode.LanguageModelChatMessage.Assistant(content, (msg as any).name));
+					}
+					break;
+				case 'tool':
+					const toolResultContent = `[Tool result for ${msg.tool_call_id || 'unknown'}]: ${content}`;
+					lmMessages.push(vscode.LanguageModelChatMessage.User(toolResultContent, (msg as any).name));
+					break;
+				default:
+					lmMessages.push(vscode.LanguageModelChatMessage.User(content, (msg as any).name));
+			}
+		}
+
+		// Build request options
+		const options: vscode.LanguageModelChatRequestOptions = {
+			justification: 'Copilot API Gateway - Responses API'
+		};
+
+		if (tools && tools.length > 0) {
+			options.tools = tools;
+			if (toolChoice === 'required' || toolChoice === 'any') {
+				options.toolMode = vscode.LanguageModelChatToolMode.Required;
+			} else {
+				options.toolMode = vscode.LanguageModelChatToolMode.Auto;
+			}
+		}
+
+		const cts = new vscode.CancellationTokenSource();
+		const timeout = setTimeout(() => cts.cancel(), (this.config.requestTimeoutSeconds || 180) * 1000);
+
+		try {
+			const response = await selectedModel!.sendRequest(lmMessages, options, cts.token);
+
+			let textContent = '';
+			const toolCalls: Array<{ name: string; arguments: any }> = [];
+
+			for await (const part of response.stream) {
+				if (cts.token.isCancellationRequested) {
+					throw new ApiError(504, `Request timed out after ${this.config.requestTimeoutSeconds}s. Try a shorter prompt or check your network connection.`, 'gateway_timeout', 'request_timeout');
+				}
+				if (part instanceof vscode.LanguageModelTextPart) {
+					textContent += part.value;
+				} else if (part instanceof vscode.LanguageModelToolCallPart) {
+					toolCalls.push({
+						name: part.name,
+						arguments: part.input
+					});
+				} else {
+					const textValue = this.extractTextFromPart(part);
+					if (textValue) { textContent += textValue; }
+				}
+			}
+
+			return {
+				content: textContent.trim(),
+				toolCalls: toolCalls.length > 0 ? toolCalls : undefined
+			};
+		} catch (error) {
+			if (error instanceof ApiError) {
+				throw error;
+			}
+			if (cts.token.isCancellationRequested) {
+				throw new ApiError(504, `Request timed out after ${this.config.requestTimeoutSeconds}s. Try a shorter prompt or check your network connection.`, 'gateway_timeout', 'request_timeout');
+			}
+			throw new ApiError(502, `Failed to retrieve Copilot response: ${getErrorMessage(error)}`, 'bad_gateway', 'command_failed', { cause: error });
+		} finally {
+			clearTimeout(timeout);
+			cts.dispose();
+		}
+	}
+
 	private async processStreamingResponsesApi(payload: ResponsesApiRequest, req: IncomingMessage, res: ServerResponse, logRequestId?: string, logRequestStart?: number): Promise<void> {
 		// OpenAI Responses API streaming format (2026 spec)
 		const input = payload?.input;
-		let messages: Array<{ role: string; content: any }> = [];
+		let messages: Array<{ role: string; content: any; tool_calls?: any[]; tool_call_id?: string }> = [];
 
 		// Handle 'instructions' as system message
 		if (payload.instructions) {
 			messages.push({ role: 'system', content: payload.instructions });
 		}
 
-		// Parse input
+		// Parse input — including function_call and function_call_output items
 		if (typeof input === 'string') {
 			messages.push({ role: 'user', content: input });
 		} else if (Array.isArray(input)) {
@@ -3244,6 +3460,24 @@ export class CopilotApiGateway implements vscode.Disposable {
 						role: item.role || 'user',
 						content: typeof item.content === 'string' ? item.content : JSON.stringify(item.content)
 					});
+				} else if (item.type === 'function_call') {
+					const fc = item as any;
+					messages.push({
+						role: 'assistant',
+						content: null,
+						tool_calls: [{
+							id: fc.call_id || fc.id,
+							type: 'function',
+							function: { name: fc.name, arguments: typeof fc.arguments === 'string' ? fc.arguments : JSON.stringify(fc.arguments) }
+						}]
+					});
+				} else if (item.type === 'function_call_output') {
+					const fco = item as any;
+					messages.push({
+						role: 'tool',
+						tool_call_id: fco.call_id || fco.id,
+						content: fco.output || ''
+					});
 				}
 			}
 		}
@@ -3251,17 +3485,6 @@ export class CopilotApiGateway implements vscode.Disposable {
 		// Inject default system prompt if needed
 		if (!payload.instructions) {
 			messages = this.injectSystemPrompt(messages);
-		}
-
-		// Build VS Code LM messages
-		const lmMessages: vscode.LanguageModelChatMessage[] = [];
-		for (const msg of messages) {
-			const content = this.redactPromptString(String(msg.content));
-			if (msg.role === 'system' || msg.role === 'user') {
-				lmMessages.push(vscode.LanguageModelChatMessage.User(content));
-			} else if (msg.role === 'assistant') {
-				lmMessages.push(vscode.LanguageModelChatMessage.Assistant(content));
-			}
 		}
 
 		const model = this.resolveModel(payload?.model);
@@ -3302,12 +3525,74 @@ export class CopilotApiGateway implements vscode.Disposable {
 				throw new ApiError(404, `Model "${model}" not found.`, 'invalid_request_error', 'model_not_found');
 			}
 
-			const lmResponse = await selectedModel.sendRequest(lmMessages, {}, cts.token);
+			// Gather tools (same pattern as processResponsesApi)
+			const baseTools = this.normalizeTools(payload?.tools) || [];
+			const mcpService = await this.ensureMcpService();
+			const mcpTools = mcpService ? await mcpService.getAllTools() : [];
+			const mappedMcpTools: vscode.LanguageModelChatTool[] = mcpTools.map(t => ({
+				name: `mcp_${t.serverName}_${t.name}`,
+				description: t.description || `Tool from MCP server ${t.serverName}`,
+				inputSchema: t.inputSchema
+			}));
+			const nativeTools = vscode.lm.tools ? Array.from(vscode.lm.tools).map(t => ({
+				name: t.name,
+				description: t.description || `Built-in VS Code tool ${t.name}`,
+				inputSchema: t.inputSchema
+			})) : [];
+			const allTools = baseTools.length > 0
+				? [...baseTools, ...mappedMcpTools, ...nativeTools]
+				: [];
+			const toolChoice = payload?.tool_choice;
+
+			// Convert messages to VS Code LM format
+			const lmMessages: vscode.LanguageModelChatMessage[] = [];
+			for (const msg of messages) {
+				const content = this.flattenMessageContent(msg.content);
+				switch (msg.role) {
+					case 'system':
+						lmMessages.push(vscode.LanguageModelChatMessage.User(`[System]: ${this.redactPromptString(content)}`));
+						break;
+					case 'user':
+						lmMessages.push(vscode.LanguageModelChatMessage.User(this.redactPromptString(content)));
+						break;
+					case 'assistant':
+						if (msg.tool_calls && msg.tool_calls.length > 0) {
+							const toolCallInfo = msg.tool_calls.map((tc: any) =>
+								`[Called function: ${tc.function?.name || tc.name} (${tc.function?.arguments || JSON.stringify(tc.arguments)})]`
+							).join('\n');
+							lmMessages.push(vscode.LanguageModelChatMessage.Assistant(this.redactPromptString(toolCallInfo)));
+						} else {
+							lmMessages.push(vscode.LanguageModelChatMessage.Assistant(this.redactPromptString(content)));
+						}
+						break;
+					case 'tool':
+						lmMessages.push(vscode.LanguageModelChatMessage.User(this.redactPromptString(`[Tool result for ${msg.tool_call_id || 'unknown'}]: ${content}`)));
+						break;
+					default:
+						lmMessages.push(vscode.LanguageModelChatMessage.User(this.redactPromptString(content)));
+				}
+			}
+
+			// Build request options with tools
+			const options: vscode.LanguageModelChatRequestOptions = {
+				justification: 'Copilot API Gateway - Responses API'
+			};
+			if (allTools.length > 0) {
+				options.tools = allTools;
+				options.toolMode = (toolChoice === 'required' || toolChoice === 'any')
+					? vscode.LanguageModelChatToolMode.Required
+					: vscode.LanguageModelChatToolMode.Auto;
+			}
+
+			const lmResponse = await selectedModel.sendRequest(lmMessages, options, cts.token);
 
 			// Store createdAt timestamp for consistency
 			const createdAt = Math.floor(Date.now() / 1000);
 
-			// Send response.created event with full spec fields
+			// Collect tool calls during streaming
+			const toolCalls: Array<{ name: string; arguments: any }> = [];
+
+			// Send response.created event
 			res.write(`event: response.created\ndata: ${JSON.stringify({
 				type: 'response.created',
 				response: {
@@ -3324,17 +3609,10 @@ export class CopilotApiGateway implements vscode.Disposable {
 					output: [],
 					parallel_tool_calls: true,
 					previous_response_id: payload.previous_response_id ?? null,
-					reasoning: {
-						effort: payload.reasoning?.effort ?? null,
-						summary: null
-					},
+					reasoning: { effort: payload.reasoning?.effort ?? null, summary: null },
 					store: payload.store ?? true,
 					temperature: payload.temperature ?? 1.0,
-					text: {
-						format: payload.text?.format ?? {
-							type: 'text'
-						}
-					},
+					text: { format: payload.text?.format ?? { type: 'text' } },
 					tool_choice: payload.tool_choice ?? 'auto',
 					tools: payload.tools ?? [],
 					top_p: payload.top_p ?? 1.0,
@@ -3345,17 +3623,11 @@ export class CopilotApiGateway implements vscode.Disposable {
 				}
 			})}\n\n`);
 
-			// Send response.output_item.added event (before content_part.added)
+			// Send response.output_item.added event (message placeholder)
 			res.write(`event: response.output_item.added\ndata: ${JSON.stringify({
 				type: 'response.output_item.added',
 				output_index: 0,
-				item: {
-					type: 'message',
-					id: messageId,
-					status: 'in_progress',
-					role: 'assistant',
-					content: []
-				}
+				item: { type: 'message', id: messageId, status: 'in_progress', role: 'assistant', content: [] }
 			})}\n\n`);
 
 			// Send content_part.added event
@@ -3370,25 +3642,36 @@ export class CopilotApiGateway implements vscode.Disposable {
 			// Stream the content
 			for await (const part of lmResponse.stream) {
 				if (cts.token.isCancellationRequested) { break; }
-				let textValue: string | undefined;
+
 				if (part instanceof vscode.LanguageModelTextPart) {
-					textValue = part.value;
-				} else if (!(part instanceof vscode.LanguageModelToolCallPart)) {
-					textValue = this.extractTextFromPart(part);
-				}
-				if (textValue) {
-					totalContent += textValue;
+					totalContent += part.value;
 					res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({
 						type: 'response.output_text.delta',
 						item_id: messageId,
 						content_index: 0,
-						delta: textValue
+						delta: part.value
 					})}\n\n`);
+				} else if (part instanceof vscode.LanguageModelToolCallPart) {
+					toolCalls.push({
+						name: part.name,
+						arguments: part.input
+					});
+				} else {
+					const textValue = this.extractTextFromPart(part);
+					if (textValue) {
+						totalContent += textValue;
+						res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({
+							type: 'response.output_text.delta',
+							item_id: messageId,
+							content_index: 0,
+							delta: textValue
+						})}\n\n`);
+					}
 				}
 			}
 
 			if (!cts.token.isCancellationRequested) {
-				// Send content_part.done event
+				// Send content_part.done for the text part
 				res.write(`event: response.content_part.done\ndata: ${JSON.stringify({
 					type: 'response.content_part.done',
 					item_id: messageId,
@@ -3397,7 +3680,7 @@ export class CopilotApiGateway implements vscode.Disposable {
 					part: { type: 'output_text', text: totalContent, annotations: [] }
 				})}\n\n`);
 
-				// Send response.output_item.done event
+				// Send response.output_item.done for the message
 				res.write(`event: response.output_item.done\ndata: ${JSON.stringify({
 					type: 'response.output_item.done',
 					output_index: 0,
@@ -3410,7 +3693,58 @@ export class CopilotApiGateway implements vscode.Disposable {
 					}
 				})}\n\n`);
 
-				// Send response.completed event
+				// Build output array: message + any function_call items
+				const outputItems: any[] = [{
+					type: 'message',
+					id: messageId,
+					status: 'completed',
+					role: 'assistant',
+					content: [{ type: 'output_text', text: totalContent, annotations: [] }]
+				}];
+
+				// If tool calls were collected, emit function_call items and build output
+				if (toolCalls.length > 0) {
+					for (const tc of toolCalls) {
+						const fcId = `call_${randomUUID().slice(0, 24)}`;
+						const fcItem = {
+							type: 'function_call',
+							id: fcId,
+							call_id: fcId,
+							name: tc.name,
+							arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments),
+							status: 'completed'
+						};
+
+						// Emit output_item.added for function_call
+						res.write(`event: response.output_item.added\ndata: ${JSON.stringify({
+							type: 'response.output_item.added',
+							output_index: outputItems.length,
+							item: fcItem
+						})}\n\n`);
+
+						// Stream arguments as delta events
+						const argsStr = typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments);
+						if (argsStr) {
+							res.write(`event: response.function_call_arguments.delta\ndata: ${JSON.stringify({
+								type: 'response.function_call_arguments.delta',
+								item_id: fcId,
+								output_index: outputItems.length,
+								delta: argsStr
+							})}\n\n`);
+						}
+
+						// Emit output_item.done for function_call
+						res.write(`event: response.output_item.done\ndata: ${JSON.stringify({
+							type: 'response.output_item.done',
+							output_index: outputItems.length,
+							item: fcItem
+						})}\n\n`);
+
+						outputItems.push(fcItem);
+					}
+				}
+
+				// Count tokens
 				let inputTokens = 0;
 				let outputTokens = 0;
 				try {
@@ -3420,6 +3754,7 @@ export class CopilotApiGateway implements vscode.Disposable {
 				} catch (e) { }
 
 				const completedAt = Math.floor(Date.now() / 1000);
+				// Send response.completed event
 				res.write(`event: response.completed\ndata: ${JSON.stringify({
 					type: 'response.completed',
 					response: {
@@ -3433,39 +3768,22 @@ export class CopilotApiGateway implements vscode.Disposable {
 						incomplete_details: null,
 						instructions: payload.instructions ?? null,
 						max_output_tokens: payload.max_output_tokens ?? null,
-						output: [{
-							type: 'message',
-							id: messageId,
-							status: 'completed',
-							role: 'assistant',
-							content: [{ type: 'output_text', text: totalContent, annotations: [] }]
-						}],
+						output: outputItems,
 						parallel_tool_calls: true,
 						previous_response_id: payload.previous_response_id ?? null,
-						reasoning: {
-							effort: payload.reasoning?.effort ?? null,
-							summary: null
-						},
+						reasoning: { effort: payload.reasoning?.effort ?? null, summary: null },
 						store: payload.store ?? true,
 						temperature: payload.temperature ?? 1.0,
-						text: {
-							format: payload.text?.format ?? {
-								type: 'text'
-							}
-						},
+						text: { format: payload.text?.format ?? { type: 'text' } },
 						tool_choice: payload.tool_choice ?? 'auto',
 						tools: payload.tools ?? [],
 						top_p: payload.top_p ?? 1.0,
 						truncation: payload.truncation ?? 'disabled',
 						usage: {
 							input_tokens: inputTokens,
-							input_tokens_details: {
-								cached_tokens: 0
-							},
+							input_tokens_details: { cached_tokens: 0 },
 							output_tokens: outputTokens,
-							output_tokens_details: {
-								reasoning_tokens: 0
-							},
+							output_tokens_details: { reasoning_tokens: 0 },
 							total_tokens: inputTokens + outputTokens
 						},
 						user: null,
@@ -3478,7 +3796,7 @@ export class CopilotApiGateway implements vscode.Disposable {
 				if (logRequestId) {
 					this.logRequest(logRequestId, 'POST', '/v1/responses', 200, Date.now() - (logRequestStart || 0), {
 						requestPayload: payload,
-						responsePayload: { id: responseId, content: totalContent },
+						responsePayload: { id: responseId, content: totalContent, toolCalls: toolCalls.length > 0 ? toolCalls : undefined },
 						tokensIn: inputTokens,
 						tokensOut: outputTokens,
 						model
@@ -3765,7 +4083,9 @@ export class CopilotApiGateway implements vscode.Disposable {
 			inputSchema: t.inputSchema
 		})) : [];
 
-		const allTools = [...baseTools, ...mappedMcpTools, ...nativeTools];
+		const allTools = baseTools.length > 0
+			? [...baseTools, ...mappedMcpTools, ...nativeTools]
+			: [];
 		const toolChoice = payload?.tool_choice || payload?.function_call;
 		const responseFormat = payload?.response_format;
 
