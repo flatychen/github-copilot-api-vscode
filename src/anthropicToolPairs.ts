@@ -65,12 +65,15 @@ export function flattenAnthropicToolResultContent(content: AnthropicToolResultCo
 	return content.map(block => block.type === 'image' ? '[image omitted]' : (block.text || '')).join('\n');
 }
 
-export function flattenAnthropicMessageForTextHistory(message: AnthropicToolPairMessage): string {
+export function flattenAnthropicMessageForTextHistory(
+	message: AnthropicToolPairMessage,
+	normalizedContent?: AnthropicToolPairContentBlock[]
+): string {
 	if (typeof message.content === 'string') {
 		return message.content;
 	}
 
-	const content = normalizeAnthropicContent(message.content);
+	const content = normalizedContent ?? normalizeAnthropicContent(message.content);
 	const parts: string[] = [];
 
 	for (const block of content) {
