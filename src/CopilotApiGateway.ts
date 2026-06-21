@@ -380,7 +380,7 @@ export class CopilotApiGateway implements vscode.Disposable {
 	private cachedCopilotHealth: { value: CopilotHealthStatus; timestamp: number } | undefined;
 	private copilotHealthPromise: Promise<CopilotHealthStatus> | undefined;
 	private compiledRedactionPatterns: { key: string; patterns: RegExp[] } | undefined;
-	private readonly CHAT_MODELS_CACHE_TTL_MS = 120000;
+	private readonly CHAT_MODELS_CACHE_TTL_MS = 14400000; // fallback: 4h, primary invalidation via onDidChangeChatModels
 	private readonly COPILOT_HEALTH_CACHE_TTL_MS = 30000;
 	private cachedBuildInfo: ExtensionBuildInfo | undefined;
 	private cachedSortedModels: vscode.LanguageModelChat[] | null = null;
@@ -405,6 +405,16 @@ export class CopilotApiGateway implements vscode.Disposable {
 		});
 		this.disposables.push(subscription);
 
+		// Invalidate model cache when VS Code language model registry changes
+		// Allows persistent caching (no TTL) since we get notified on actual changes
+		if (typeof vscode.lm.onDidChangeChatModels === 'function') {
+			const modelChangeSub = vscode.lm.onDidChangeChatModels(() => {
+				this.cachedChatModels = undefined;
+				this.modelListGeneration++;
+			});
+			this.disposables.push(modelChangeSub);
+		}
+
 		// Initialize stats from persistent storage (async, non-blocking)
 		this.initializeStats().catch(err => console.error('Failed to initialize stats:', err));
 		// Load request history (async, non-blocking)
@@ -423,8 +433,8 @@ export class CopilotApiGateway implements vscode.Disposable {
 	}
 
 	private async getCachedChatModels(forceRefresh = false): Promise<vscode.LanguageModelChat[]> {
-		const now = Date.now();
-		if (!forceRefresh && this.cachedChatModels && now - this.cachedChatModels.timestamp < this.CHAT_MODELS_CACHE_TTL_MS) {
+		// Primary: onDidChangeChatModels event invalidates. Fallback: TTL safety net.
+		if (!forceRefresh && this.cachedChatModels && Date.now() - this.cachedChatModels.timestamp < this.CHAT_MODELS_CACHE_TTL_MS) {
 			return this.cachedChatModels.models;
 		}
 
@@ -2503,8 +2513,10 @@ export class CopilotApiGateway implements vscode.Disposable {
 			let inputTokens = 0;
 			let outputTokens = 0;
 			try {
-				inputTokens = await lmModel.countTokens(promptStr, cts.token);
-				outputTokens = await lmModel.countTokens(totalContent, cts.token);
+				[inputTokens, outputTokens] = await Promise.all([
+					lmModel.countTokens(promptStr, cts.token),
+					lmModel.countTokens(totalContent, cts.token)
+				]);
 			} catch (e) { }
 
 			if (logRequestId) {
@@ -2710,8 +2722,10 @@ export class CopilotApiGateway implements vscode.Disposable {
 			let inputTokens = 0;
 			let outputTokens = 0;
 			try {
-				inputTokens = await lmModel.countTokens(promptStr, cts.token);
-				outputTokens = await lmModel.countTokens(totalContent, cts.token);
+				[inputTokens, outputTokens] = await Promise.all([
+					lmModel.countTokens(promptStr, cts.token),
+					lmModel.countTokens(totalContent, cts.token)
+				]);
 			} catch (e) { }
 
 			if (logRequestId) {
@@ -3900,8 +3914,10 @@ let finalText = '';
 				.filter(b => b.type === 'text')
 				.map(b => (b as { type: 'text'; text: string }).text)
 				.join('');
-			inputTokens = await collected.lmModel.countTokens(promptStr);
-			outputTokens = await collected.lmModel.countTokens(allText);
+			[inputTokens, outputTokens] = await Promise.all([
+				collected.lmModel.countTokens(promptStr),
+				collected.lmModel.countTokens(allText)
+			]);
 		} catch (e) {
 			console.error('Anthropic token counting failed:', e);
 		}
