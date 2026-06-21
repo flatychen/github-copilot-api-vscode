@@ -380,7 +380,7 @@ export class CopilotApiGateway implements vscode.Disposable {
 	private cachedCopilotHealth: { value: CopilotHealthStatus; timestamp: number } | undefined;
 	private copilotHealthPromise: Promise<CopilotHealthStatus> | undefined;
 	private compiledRedactionPatterns: { key: string; patterns: RegExp[] } | undefined;
-	private readonly CHAT_MODELS_CACHE_TTL_MS = 30000;
+	private readonly CHAT_MODELS_CACHE_TTL_MS = 120000;
 	private readonly COPILOT_HEALTH_CACHE_TTL_MS = 30000;
 	private cachedBuildInfo: ExtensionBuildInfo | undefined;
 	private cachedSortedModels: vscode.LanguageModelChat[] | null = null;
@@ -3153,11 +3153,11 @@ export class CopilotApiGateway implements vscode.Disposable {
 
 		let iterations = 0;
 		const MAX_ITERATIONS = 5;
-		let result: { content: string; toolCalls?: Array<{ name: string; arguments: any }> } = { content: '' };
-		let finalText = '';
+						let finalToolCalls: Array<{ name: string; arguments: any }> | undefined;
+let finalText = '';
 
 		while (iterations < MAX_ITERATIONS) {
-			result = await this.runWithConcurrency(() =>
+			const result = await this.runWithConcurrency(() =>
 				this.invokeResponsesApiWithTools(messages, allTools, toolChoice, selectedModel)
 			);
 
@@ -3190,11 +3190,10 @@ export class CopilotApiGateway implements vscode.Disposable {
 								const serverName = parts[1];
 								const toolName = parts.slice(2).join('_');
 
-								const mcp = await this.ensureMcpService();
-								if (!mcp) {
+								if (!mcpService) {
 									throw new Error('MCP service not available');
 								}
-								toolResult = await mcp.callTool(serverName, toolName, tc.arguments);
+								toolResult = await mcpService.callTool(serverName, toolName, tc.arguments);
 							} else {
 								// Native VS Code tools (includes file read/write etc.)
 								toolResult = await this.invokeVSCodeTool(tc.name, tc.arguments);
@@ -3220,6 +3219,7 @@ export class CopilotApiGateway implements vscode.Disposable {
 
 			// If we get here, either no tool calls or no MCP/native tool calls
 			finalText = result.content || '';
+			finalToolCalls = result.toolCalls;
 			break;
 		}
 
@@ -3253,8 +3253,8 @@ export class CopilotApiGateway implements vscode.Disposable {
 		});
 
 		// If there are client-side tool calls from the last iteration, include them as function_call items
-		if (result?.toolCalls && result.toolCalls.length > 0) {
-			for (const tc of result.toolCalls) {
+		if (finalToolCalls && finalToolCalls.length > 0) {
+			for (const tc of finalToolCalls) {
 				finalOutput.push({
 					type: 'function_call',
 					id: `call_${randomUUID().slice(0, 24)}`,
@@ -3326,6 +3326,49 @@ export class CopilotApiGateway implements vscode.Disposable {
 	}
 
 	/**
+	 * Convert an array of chat messages (OpenAI / Responses API format) into
+	 * vscode.LanguageModelChatMessage objects, applying redaction if requested.
+	 */
+	private messagesToLmMessages(
+		messages: Array<{ role: string; content: unknown; tool_calls?: any[]; tool_call_id?: string }>,
+		options?: { redact?: boolean; includeName?: boolean }
+	): vscode.LanguageModelChatMessage[] {
+		const redact = options?.redact === true;
+		const includeName = options?.includeName === true;
+		const applyRedact = (s: string): string => redact ? this.redactPromptString(s) : s;
+
+		const result: vscode.LanguageModelChatMessage[] = [];
+		for (const msg of messages) {
+			const content = this.flattenMessageContent(msg.content);
+			const name = includeName ? (msg as any).name : undefined;
+
+			switch (msg.role) {
+				case 'system':
+					result.push(vscode.LanguageModelChatMessage.User(applyRedact(`[System]: ${content}`), name));
+					break;
+				case 'user':
+					result.push(vscode.LanguageModelChatMessage.User(applyRedact(content), name));
+					break;
+				case 'assistant':
+					if (msg.tool_calls && msg.tool_calls.length > 0) {
+						const toolCallInfo = msg.tool_calls.map((tc: any) =>
+							`[Called function: ${tc.function?.name || tc.name} (${tc.function?.arguments || JSON.stringify(tc.arguments)})]`
+						).join('\n');
+						result.push(vscode.LanguageModelChatMessage.Assistant(applyRedact(toolCallInfo), name));
+					} else {
+						result.push(vscode.LanguageModelChatMessage.Assistant(applyRedact(content), name));
+					}
+					break;
+				case 'tool':
+					result.push(vscode.LanguageModelChatMessage.User(applyRedact(`[Tool result for ${msg.tool_call_id || 'unknown'}]: ${content}`), name));
+					break;
+				default:
+					result.push(vscode.LanguageModelChatMessage.User(applyRedact(content), name));
+			}
+		}
+		return result;
+	}
+	/**
 	 * Invoke the VS Code LM with tool awareness for the Responses API.
 	 * Mirrors invokeCopilotWithTools but without the health / installation checks
 	 * since processResponsesApi already validates those.
@@ -3336,37 +3379,7 @@ export class CopilotApiGateway implements vscode.Disposable {
 		toolChoice?: any,
 		selectedModel?: vscode.LanguageModelChat
 	): Promise<{ content: string; toolCalls?: Array<{ name: string; arguments: any }> }> {
-		// Convert messages to VS Code format
-		const lmMessages: vscode.LanguageModelChatMessage[] = [];
-
-		for (const msg of messages) {
-			const content = this.flattenMessageContent(msg.content);
-			switch (msg.role) {
-				case 'system':
-					lmMessages.push(vscode.LanguageModelChatMessage.User(`[System]: ${content}`, (msg as any).name));
-					break;
-				case 'user':
-					lmMessages.push(vscode.LanguageModelChatMessage.User(content, (msg as any).name));
-					break;
-				case 'assistant':
-					if (msg.tool_calls && msg.tool_calls.length > 0) {
-						const toolCallInfo = msg.tool_calls.map((tc: any) =>
-							`[Called function: ${tc.function?.name || tc.name} (${tc.function?.arguments || JSON.stringify(tc.arguments)})]`
-						).join('\n');
-						lmMessages.push(vscode.LanguageModelChatMessage.Assistant(toolCallInfo, (msg as any).name));
-					} else {
-						lmMessages.push(vscode.LanguageModelChatMessage.Assistant(content, (msg as any).name));
-					}
-					break;
-				case 'tool':
-					const toolResultContent = `[Tool result for ${msg.tool_call_id || 'unknown'}]: ${content}`;
-					lmMessages.push(vscode.LanguageModelChatMessage.User(toolResultContent, (msg as any).name));
-					break;
-				default:
-					lmMessages.push(vscode.LanguageModelChatMessage.User(content, (msg as any).name));
-			}
-		}
-
+		const lmMessages = this.messagesToLmMessages(messages, { redact: true, includeName: true });
 		// Build request options
 		const options: vscode.LanguageModelChatRequestOptions = {
 			justification: 'Copilot API Gateway - Responses API'
@@ -3531,35 +3544,7 @@ export class CopilotApiGateway implements vscode.Disposable {
 				: [];
 			const toolChoice = payload?.tool_choice;
 
-			// Convert messages to VS Code LM format
-			const lmMessages: vscode.LanguageModelChatMessage[] = [];
-			for (const msg of messages) {
-				const content = this.flattenMessageContent(msg.content);
-				switch (msg.role) {
-					case 'system':
-						lmMessages.push(vscode.LanguageModelChatMessage.User(`[System]: ${this.redactPromptString(content)}`));
-						break;
-					case 'user':
-						lmMessages.push(vscode.LanguageModelChatMessage.User(this.redactPromptString(content)));
-						break;
-					case 'assistant':
-						if (msg.tool_calls && msg.tool_calls.length > 0) {
-							const toolCallInfo = msg.tool_calls.map((tc: any) =>
-								`[Called function: ${tc.function?.name || tc.name} (${tc.function?.arguments || JSON.stringify(tc.arguments)})]`
-							).join('\n');
-							lmMessages.push(vscode.LanguageModelChatMessage.Assistant(this.redactPromptString(toolCallInfo)));
-						} else {
-							lmMessages.push(vscode.LanguageModelChatMessage.Assistant(this.redactPromptString(content)));
-						}
-						break;
-					case 'tool':
-						lmMessages.push(vscode.LanguageModelChatMessage.User(this.redactPromptString(`[Tool result for ${msg.tool_call_id || 'unknown'}]: ${content}`)));
-						break;
-					default:
-						lmMessages.push(vscode.LanguageModelChatMessage.User(this.redactPromptString(content)));
-				}
-			}
-
+			const lmMessages = this.messagesToLmMessages(messages, { redact: true, includeName: false });
 			// Build request options with tools
 			const options: vscode.LanguageModelChatRequestOptions = {
 				justification: 'Copilot API Gateway - Responses API'
@@ -4126,11 +4111,10 @@ export class CopilotApiGateway implements vscode.Disposable {
 								const serverName = parts[1];
 								const toolName = parts.slice(2).join('_');
 
-								const mcp = await this.ensureMcpService();
-								if (!mcp) {
+																if (!mcpService) {
 									throw new Error('MCP service not available');
 								}
-								toolResult = await mcp.callTool(serverName, toolName, tc.arguments);
+								toolResult = await mcpService.callTool(serverName, toolName, tc.arguments);
 							} else {
 								// Native tools
 								toolResult = await this.invokeVSCodeTool(tc.name, tc.arguments);
@@ -4289,40 +4273,7 @@ export class CopilotApiGateway implements vscode.Disposable {
 			model = copilotModels[0];
 		}
 
-		// Convert messages to VS Code format
-		const lmMessages: vscode.LanguageModelChatMessage[] = [];
-
-		for (const msg of chatMessages) {
-			const content = this.flattenMessageContent(msg.content);
-
-			switch (msg.role) {
-				case 'system':
-					lmMessages.push(vscode.LanguageModelChatMessage.User(`[System]: ${content} `, (msg as any).name));
-					break;
-				case 'user':
-					lmMessages.push(vscode.LanguageModelChatMessage.User(content, (msg as any).name));
-					break;
-				case 'assistant':
-					if (msg.tool_calls && msg.tool_calls.length > 0) {
-						// Assistant message with tool calls - include tool call info
-						const toolCallInfo = msg.tool_calls.map((tc: any) =>
-							`[Called function: ${tc.function?.name || tc.name} (${tc.function?.arguments || JSON.stringify(tc.arguments)})]`
-						).join('\n');
-						lmMessages.push(vscode.LanguageModelChatMessage.Assistant(toolCallInfo, (msg as any).name));
-					} else {
-						lmMessages.push(vscode.LanguageModelChatMessage.Assistant(content, (msg as any).name));
-					}
-					break;
-				case 'tool':
-					// Tool result message
-					const toolResultContent = `[Tool result for ${msg.tool_call_id || 'unknown'}]: ${content} `;
-					lmMessages.push(vscode.LanguageModelChatMessage.User(toolResultContent, (msg as any).name));
-					break;
-				default:
-					lmMessages.push(vscode.LanguageModelChatMessage.User(content, (msg as any).name));
-			}
-		}
-
+		const lmMessages = this.messagesToLmMessages(chatMessages, { redact: false, includeName: true });
 		// Build request options
 		const options: vscode.LanguageModelChatRequestOptions = {
 			justification: 'Copilot API Gateway'
@@ -4915,12 +4866,7 @@ export class CopilotApiGateway implements vscode.Disposable {
 
 			if (isUser) {
 				// Only preserve tool results as structured parts when the preceding tool call is complete.
-				const toolResultBlocks = contentArr.filter(p => p.type === 'tool_result') as Array<{
-					type: 'tool_result'; tool_use_id: string;
-					content: AnthropicToolResultContent;
-				}>;
-
-				if (toolResultBlocks.length > 0 && structuredToolPairs.userIndexes.has(messageIndex)) {
+				if (structuredToolPairs.userIndexes.has(messageIndex)) {
 					// Build a user message carrying LanguageModelToolResultPart items
 					const parts: (vscode.LanguageModelToolResultPart | vscode.LanguageModelTextPart)[] = [];
 					for (const blk of contentArr) {
@@ -4945,11 +4891,7 @@ export class CopilotApiGateway implements vscode.Disposable {
 				}
 			} else {
 				// Assistant turn — check for tool_use blocks
-				const toolUseBlocks = contentArr.filter(p => p.type === 'tool_use') as Array<{
-					type: 'tool_use'; id: string; name: string; input: any;
-				}>;
-
-				if (toolUseBlocks.length > 0 && structuredToolPairs.assistantIndexes.has(messageIndex)) {
+				if (structuredToolPairs.assistantIndexes.has(messageIndex)) {
 					// Build an assistant message carrying LanguageModelToolCallPart items
 					const parts: (vscode.LanguageModelToolCallPart | vscode.LanguageModelTextPart)[] = [];
 					for (const blk of contentArr) {
@@ -6571,8 +6513,11 @@ export class CopilotApiGateway implements vscode.Disposable {
 			responseHeaders: extra?.responseHeaders
 		};
 
-		const redactedEntry = this.redactSensitiveData(logEntry);
-		this.auditService.logRequest(redactedEntry);
+		const compiledPatterns = this.getCompiledRedactionPatterns();
+		const hasLogConsumers = this.config.enableLogging || (this.wsServer && this.wsServer.clients.size > 0);
+		const redactedEntry = (compiledPatterns.length > 0 && hasLogConsumers)
+			? this.redactSensitiveData(logEntry)
+			: logEntry;		this.auditService.logRequest(redactedEntry);
 
 		// Broadcast to internal listeners (like Dashboard)
 		this._onDidLogRequest.fire(redactedEntry);
