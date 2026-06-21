@@ -10,3 +10,4 @@ out/
 bun.lock
 coverage/
 .idea/
+dist/
